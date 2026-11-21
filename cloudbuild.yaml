@@ -1,0 +1,91 @@
+# Pipeline of the WordPress fork. Triggers are defined in
+# enrique-jose/iac-wp-gcp-cicd (bootstrap/):
+#   wp-cicd-app-pr     PR to main   -> _DEPLOY=false : lint + docker build
+#   wp-cicd-app-deploy push to main -> _DEPLOY=true  : + push, deploy, smoke test, rollback on failure
+substitutions:
+  _REGION: us-east1
+  _AR_REPO: us-east1-docker.pkg.dev/cool-academy-489503-f3/wp-cicd
+  _SERVICE: wp-cicd-service
+  _LB_IP: wp-cicd-lb-ip # name of the global address of the load balancer
+  _DEPLOY: "false"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
+
+steps:
+  # Syntax check of our own code (themes / plugins / mu-plugins)
+  - id: php-lint
+    name: php:8.3-cli
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        find wp-content -name '*.php' -not -path '*/vendor/*' -print0 \
+          | xargs -0 -n1 -P4 php -d display_errors=stderr -l > /dev/null
+        echo "php -l OK"
+    waitFor: ["-"]
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        docker pull ${_AR_REPO}/wordpress:main || true
+        docker build \
+          --cache-from ${_AR_REPO}/wordpress:main \
+          --label org.opencontainers.image.revision=$COMMIT_SHA \
+          -t ${_AR_REPO}/wordpress:$SHORT_SHA \
+          -t ${_AR_REPO}/wordpress:main .
+    waitFor: ["php-lint"]
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        if [ "${_DEPLOY}" != "true" ]; then echo "PR build: skipping push"; exit 0; fi
+        docker push --all-tags ${_AR_REPO}/wordpress
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        if [ "${_DEPLOY}" != "true" ]; then echo "PR build: skipping deploy"; exit 0; fi
+        DIGEST=$(gcloud artifacts docker images describe ${_AR_REPO}/wordpress:$SHORT_SHA \
+                   --format='value(image_summary.digest)')
+        gcloud run services describe ${_SERVICE} --region ${_REGION} \
+          --format='value(status.latestReadyRevisionName)' > /workspace/previous_revision
+        echo "Previous revision: $(cat /workspace/previous_revision)"
+        gcloud run services update ${_SERVICE} --region ${_REGION} \
+          --image ${_AR_REPO}/wordpress@$${DIGEST}
+        # A previous rollback pins traffic to a revision: send it back to the latest one
+        gcloud run services update-traffic ${_SERVICE} --region ${_REGION} --to-latest
+
+  - id: smoke-test
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -uo pipefail
+        if [ "${_DEPLOY}" != "true" ]; then echo "PR build: skipping smoke test"; exit 0; fi
+        IP=$(gcloud compute addresses describe ${_LB_IP} --global --format='value(address)')
+        for i in $(seq 1 18); do
+          CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 15 "http://$${IP}/wp-login.php")
+          if [ "$${CODE}" = "200" ]; then echo "Smoke test OK (http://$${IP})"; exit 0; fi
+          echo "Attempt $${i}/18: HTTP $${CODE}"; sleep 10
+        done
+        PREV=$(cat /workspace/previous_revision)
+        echo "Smoke test FAILED -> rolling back traffic to $${PREV}" >&2
+        gcloud run services update-traffic ${_SERVICE} --region ${_REGION} --to-revisions="$${PREV}=100"
+        exit 1
+
+timeout: 1800s
