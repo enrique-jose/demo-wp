@@ -9,6 +9,6 @@ defined( 'ABSPATH' ) || exit;
 add_action(
 	'send_headers',
 	static function () {
-		header( 'X-Demo-WP: fork' );
+		header( 'X-Demo-WP: fork-v2' );
 	}
 );
